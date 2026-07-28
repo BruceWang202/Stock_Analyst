@@ -57,6 +57,7 @@ REPORTS = {
     "扫描汇总": "summary.md",
     "行业胜率": "行业胜率.md",
     "成交量参考": "成交量参考.md",
+    "目标单回测": "目标单回测.md",
     "带止损回测": "backtest.md",
     "高抛低吸": "band_trade.md",
     "持有上限对比": "compare_hold.md",
@@ -125,6 +126,12 @@ a{color:var(--acc)}.note{color:var(--warn)}select{width:100%;padding:7px;backgro
 <div id=skylbl style="font-size:12px;color:var(--mut);margin:2px 0">分位 0.99（越高越少卖天量）</div>
 <button onclick="s6sky(0)">重算看效果</button>
 <button onclick="s6sky(1)">应用为默认</button>
+<h3>目标单回测</h3>
+<div style="font-size:12px;color:var(--mut);display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+目标%<input id=tgt type=number value=15 style="width:48px;padding:4px;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px">
+窗口<input id=twin type=number value=30 style="width:44px;padding:4px;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px">
+止损%<input id=tstop type=number value=8 style="width:40px;padding:4px;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px"></div>
+<button onclick="targetbt()">🎯 回测</button>
 <h3>查看报告</h3><div id=reps></div>
 <h3>数据表(CSV)</h3><select id=csv onchange="loadCsv(this.value)"><option value="">选择…</option></select>
 </aside>
@@ -163,6 +170,8 @@ async function report(k){busy('加载报告…');const r=await fetch('/report?k=
  done('');$('#content').innerHTML=j.ok?j.html:'<p class=note>'+esc(j.err)+'</p>'}
 async function loadCsv(name){if(!name)return;busy('加载 '+name);const r=await fetch('/csv?f='+encodeURIComponent(name));
  const j=await r.json();done('');$('#content').innerHTML='<h2>'+name+'</h2>'+(j.ok?j.html:'<p class=note>'+esc(j.err)+'</p>')}
+async function targetbt(){const t=($('#tgt').value||15)/100,w=$('#twin').value||30,s=($('#tstop').value||8)/100;busy('目标单回测…（首次载入数据稍慢）');
+ const r=await fetch('/targetbt?target='+t+'&window='+w+'&stop='+s);const j=await r.json();done('');$('#content').innerHTML=j.html}
 function skyLbl(){$('#skylbl').textContent='分位 '+$('#sky').value+'（越高越少卖天量）'}
 async function s6sky(save){const p=$('#sky').value;busy('重算 ⑥ 天量分位 '+p+'…（首次载入数据稍慢）');
  const r=await fetch('/s6sky?pct='+p+(save?'&save=1':''));const j=await r.json();
@@ -542,6 +551,30 @@ def s6sky():
             f"{'、'.join(sky_now) if sky_now else '无'}</p>")
     if save:
         html += "<p style='color:var(--ok)'>✅ 已保存为默认，全流程(回测/分析/成交量参考)将采用此分位</p>"
+    return jsonify(ok=True, html=html)
+
+
+@app.route("/targetbt")
+def targetbt():
+    import pandas as pd
+    from target_backtest import STRATS as TS, run_signals, stat
+    target = float(request.args.get("target", 0.15))
+    window = int(request.args.get("window", 30))
+    stop = float(request.args.get("stop", 0.08))
+    series = _s6_series()
+    rows = []
+    for label, fn in TS:
+        p = os.path.join(OUT, fn)
+        if not os.path.exists(p):
+            continue
+        hits = pd.read_csv(p)
+        if hits.empty:
+            continue
+        rows.append({"策略": label, **stat(run_signals(series, hits, target, window, stop))})
+    html = (f"<h2>目标单回测：+{target*100:.0f}% 目标 / {window} 交易日 / 止损 {stop*100:.0f}%</h2>"
+            "<p class=note>次日开盘建仓 → 窗口内收盘触及目标止盈 / 跌破止损 / 到期收盘离场。"
+            "达标率=触及目标(止盈)占比。⚠️ 历史回测，不构成投资建议。</p>"
+            + pd.DataFrame(rows).to_html(index=False, border=0))
     return jsonify(ok=True, html=html)
 
 
