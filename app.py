@@ -274,26 +274,52 @@ def runall():
     return jsonify(ok=True, output="\n".join(log))
 
 
+# 扫描页展示的策略与顺序(按胜率高→低)：④ ⑥ ⑤ ①（其余不展示）
 SCAN_STRATS = [
-    ("① 平台突破缩量回踩", "strategy1_platform_pullback.csv"),
-    ("③ 年线放量突破", "strategy3_annual_line.csv"),
     ("④ MACD 底背离", "strategy4_macd_divergence.csv"),
-    ("⑤ 放量突破前高回踩", "strategy5_prevhigh_retest.csv"),
     ("⑥ 缩量+十日线向上", "strategy6_vol_shrink_ma10.csv"),
+    ("⑤ 放量突破前高回踩", "strategy5_prevhigh_retest.csv"),
+    ("① 平台突破缩量回踩", "strategy1_platform_pullback.csv"),
 ]
+
+
+def _sig_outcome(g, sig_date, target=0.15, window=30, stop=0.08):
+    """单条信号的目标单回测结果：次日开盘建仓→目标止盈/止损/到期。返回(结果, 收益%)。"""
+    import pandas as pd
+    if g is None:
+        return ("无数据", None)
+    idx = g.index[g["Date"] == sig_date]
+    if len(idx) == 0:
+        return ("无数据", None)
+    i = int(idx[0])
+    if i + 1 >= len(g):
+        return ("待开盘", None)
+    entry = g["Open"].iloc[i + 1]
+    if pd.isna(entry) or entry <= 0:
+        return ("无数据", None)
+    tp = entry * (1 + target)
+    sl = entry * (1 - stop) if stop else None
+    last = len(g) - 1
+    end = i + window
+    for j in range(i + 1, min(end, last) + 1):
+        cl = g["Close"].iloc[j]
+        if cl >= tp:
+            return ("止盈✅", round((cl / entry - 1) * 100, 1))
+        if sl is not None and cl <= sl:
+            return ("止损❌", round((cl / entry - 1) * 100, 1))
+    if end <= last:                                  # 窗口已走完，未触及目标/止损
+        r = (g["Close"].iloc[end] / entry - 1) * 100
+        return ("到期" + ("✅" if r > 0 else "❌"), round(r, 1))
+    r = (g["Close"].iloc[last] / entry - 1) * 100    # 数据还没满窗口
+    return ("持有中", round(r, 1))
 
 
 def build_scan_html():
     """从现有扫描结果文件构建结构化视图(不重新扫描)。"""
     import pandas as pd
-    parts = []
-    # ① 汇总
-    sp = os.path.join(OUT, "summary.md")
-    if os.path.exists(sp):
-        parts.append(md.markdown(open(sp, encoding="utf-8").read(), extensions=["tables"]))
-    # 读各策略信号
-    frames = {}
-    gmax = None
+    parts = ["<h2>② 扫描形态信号</h2>"]
+    # 读展示的策略信号
+    frames, gmax = {}, None
     for label, fn in SCAN_STRATS:
         p = os.path.join(OUT, fn)
         if not os.path.exists(p):
@@ -305,33 +331,56 @@ def build_scan_html():
         frames[label] = d
         m = d["SignalDate"].max()
         gmax = m if gmax is None else max(gmax, m)
-    # ② 昨日(最新)信号
-    parts.append(f"<h2>昨日信号（最新信号日 {gmax.date() if gmax is not None else '-'}）</h2>")
+    # ── 一、形态扫描结果(概览：仅 ④⑥⑤①) ──
+    parts.append("<h2>一、形态扫描结果</h2>")
     if gmax is not None:
-        rows = []
-        for label, d in frames.items():
-            y = d[d["SignalDate"] == gmax]
-            for _, r in y.iterrows():
-                rows.append({"策略": label, "代码": r.get("Ticker", ""), "名称": r.get("名称", ""),
-                             "行业": r.get("行业", ""), "信号日": r["SignalDate"].date()})
-        if rows:
-            parts.append(pd.DataFrame(rows).to_html(index=False, border=0))
-        else:
-            parts.append("<p>昨日无信号</p>")
-    # ③ 近90天信号(按策略)
-    parts.append("<h2>近90天信号（按策略）</h2>")
-    if gmax is not None:
-        cut = gmax - pd.Timedelta(days=90)
-        for label, d in frames.items():
-            recent = d[d["SignalDate"] >= cut].sort_values("SignalDate", ascending=False)
-            parts.append(f"<h3>{label}　近90天 {len(recent)} 个</h3>")
-            if recent.empty:
-                parts.append("<p>无</p>")
+        c90 = gmax - pd.Timedelta(days=90)
+        c30 = gmax - pd.Timedelta(days=30)
+        ov = []
+        for label, fn in SCAN_STRATS:
+            d = frames.get(label)
+            if d is None:
+                ov.append({"策略": label, "信号总数": 0})
                 continue
-            show = recent.drop(columns=[c for c in ["Market"] if c in recent.columns]).copy()
-            show["SignalDate"] = show["SignalDate"].dt.date
-            parts.append(show.to_html(index=False, border=0))
-    return "<h2>② 扫描形态信号</h2>" + "".join(parts)
+            ov.append({"策略": label, "信号总数": len(d),
+                       "近90天": int((d["SignalDate"] >= c90).sum()),
+                       "近30天": int((d["SignalDate"] >= c30).sum()),
+                       "昨日": int((d["SignalDate"] == gmax).sum())})
+        parts.append(f"<p class=note>最新信号日 {gmax.date()}</p>")
+        parts.append(pd.DataFrame(ov).to_html(index=False, border=0))
+    # ── 二、按策略(④⑥⑤①·胜率序)：昨日信号 + 近90天(带回测胜败) ──
+    parts.append("<h2>二、分策略信号（④⑥⑤① · 按胜率排序）</h2>")
+    parts.append("<p class=note>近90天信号「结果」列为目标单回测：次日开盘建仓 → 30日内 +15% 止盈 / -8% 止损 / 到期离场。</p>")
+    series = _s6_series() if frames else {}
+    cut = (gmax - pd.Timedelta(days=90)) if gmax is not None else None
+    for label, fn in SCAN_STRATS:
+        d = frames.get(label)
+        parts.append(f"<h3>{label}</h3>")
+        if d is None:
+            parts.append("<p>无信号数据</p>")
+            continue
+        # 昨日信号
+        y = d[d["SignalDate"] == gmax]
+        parts.append(f"<h4>昨日信号（{gmax.date()}）</h4>")
+        if y.empty:
+            parts.append("<p>昨日无信号</p>")
+        else:
+            yt = pd.DataFrame({"代码": y["Ticker"], "名称": y.get("名称", ""), "行业": y.get("行业", "")})
+            parts.append(yt.to_html(index=False, border=0))
+        # 近90天信号 + 回测胜败
+        recent = d[d["SignalDate"] >= cut].sort_values("SignalDate", ascending=False)
+        rows = []
+        for _, r in recent.iterrows():
+            res, ret = _sig_outcome(series.get(r["Ticker"]), r["SignalDate"])
+            rows.append({"信号日": r["SignalDate"].date(), "代码": r["Ticker"], "名称": r.get("名称", ""),
+                         "行业": r.get("行业", ""), "结果": res, "收益%": ret})
+        rr = pd.DataFrame(rows)
+        done = rr[~rr["结果"].isin(["持有中", "无数据", "待开盘"])] if not rr.empty else rr
+        win = int(done["结果"].str.contains("✅").sum()) if not done.empty else 0
+        wr = f"　已结 {len(done)} · 胜 {win}（{win/len(done)*100:.0f}%）" if len(done) else ""
+        parts.append(f"<h4>近90天信号（{len(recent)} 个）{wr}</h4>")
+        parts.append(rr.to_html(index=False, border=0) if not rr.empty else "<p>无</p>")
+    return "".join(parts)
 
 
 # 各执行流程点击后展示的"最近结果"：md报告 / 特殊视图
