@@ -138,17 +138,23 @@ function done(t){$('#status').textContent=t}
 ACTS.forEach(a=>{const b=document.createElement('button');b.textContent=a[1];b.onclick=()=>showAction(a[0],a[1]);$('#acts').append(b)});
 async function showAction(id,name){busy('加载「'+name+'」最近结果…');const r=await fetch('/view/'+id);const j=await r.json();done('');
  const c=$('#content');c.innerHTML='';
- const b=document.createElement('button');b.textContent='🔄 重新执行';b.style.cssText='width:auto;padding:6px 14px;border-color:var(--acc);color:var(--acc);margin-bottom:10px';b.onclick=()=>rerun(id,name);
- const d=document.createElement('div');d.innerHTML=j.html;c.append(b);c.append(d)}
-async function rerun(id,name){busy('重新执行「'+name+'」…（可能几十秒~几分钟）');await fetch('/run/'+id,{method:'POST'});done('✅ '+name+' 已重新执行');showAction(id,name);refreshState()}
+ const bar=document.createElement('div');bar.style.cssText='margin-bottom:10px;display:flex;align-items:center;gap:10px';
+ const b=document.createElement('button');b.textContent='▶ 执行流程';b.style.cssText='width:auto;padding:7px 16px;border-color:var(--ok);color:var(--ok);font-weight:600;margin:0';b.onclick=()=>rerun(id,name);
+ const hint=document.createElement('span');hint.style.cssText='color:var(--mut);font-size:12px';hint.textContent='下面是最近一次结果；点「执行流程」在后台重新运行';
+ bar.append(b);bar.append(hint);
+ const d=document.createElement('div');d.innerHTML=j.html;c.append(bar);c.append(d)}
+const POLL={};
+function pollJob(id,name){if(POLL[id])clearInterval(POLL[id]);
+ POLL[id]=setInterval(async()=>{const r=await fetch('/job/'+id);const j=await r.json();
+  if(j.status==='running'){busy('后台执行「'+name+'」…（可随意切换查看其他，完成会提示）');}
+  else{clearInterval(POLL[id]);POLL[id]=null;done((j.status==='done'?'✅ ':'⚠️ ')+name+' 执行完成');
+   if(id==='all'||id==='download'){$('#content').innerHTML='<h2>'+name+'</h2><pre>'+esc(j.output||'')+'</pre>';}
+   else{showAction(id,name);} refreshState();}},2000)}
+async function rerun(id,name){busy('「'+name+'」已在后台开始…');const r=await fetch('/runasync/'+id,{method:'POST'});const j=await r.json();
+ if(j.running)busy('「'+name+'」正在后台运行中…');pollJob(id,name)}
 Object.keys(REPS).forEach(k=>{const b=document.createElement('button');b.className='rep';b.textContent='📄 '+k;b.onclick=()=>report(k);$('#reps').append(b)});
-async function run(id,name){busy('执行「'+name+'」…（可能需要几十秒）');
- const r=await fetch('/run/'+id,{method:'POST'});const j=await r.json();
- done((j.ok?'✅ ':'⚠️ ')+name+' 完成');
- $('#content').innerHTML='<h2>'+name+'</h2><pre>'+esc(j.output||'(无输出)')+'</pre>';refreshState()}
-async function runAll(){busy('一键全跑：个股信息→下载→扫描→分析→优选→行业胜率（约几分钟，请稍候）…');
- const r=await fetch('/runall',{method:'POST'});const j=await r.json();
- done('✅ 一键全跑完成');$('#content').innerHTML='<h2>🚀 一键全跑</h2><pre>'+esc(j.output)+'</pre>';refreshState()}
+async function runAll(){busy('🚀 一键全跑 已在后台开始（个股信息→下载→扫描→分析→优选→行业胜率）…');
+ await fetch('/runasync/all',{method:'POST'});pollJob('all','🚀 一键全跑')}
 async function backfill(){const s=$('#start').value;if(!s){alert('请选开始日期');return}
  busy('回补 '+s+' 至今…（较慢，请耐心）');
  const r=await fetch('/backfill?start='+s,{method:'POST'});const j=await r.json();
@@ -202,18 +208,60 @@ def run_action(aid):
     return jsonify(ok=(rc == 0), output=out)
 
 
+# ---------- 异步任务：后台线程执行，前端轮询 ----------
+JOBS = {}   # aid -> {"status": running/done/error, "output": str}
+
+
+def _job_one(aid):
+    try:
+        if aid == "download":
+            rc, out = run_cmd(ACTIONS[aid][1], cwd=DL_DIR, py=DL_PY)
+        else:
+            rc, out = run_cmd(ACTIONS[aid][1])
+        JOBS[aid] = {"status": "done" if rc == 0 else "error", "output": out}
+    except Exception as e:
+        JOBS[aid] = {"status": "error", "output": str(e)}
+
+
+def _job_all():
+    log = []
+    for name, args, use_dl in PIPELINE:
+        JOBS["all"] = {"status": "running", "output": "\n".join(log + [f"▶ 正在 {name} …"])}
+        rc, out = run_cmd(args, cwd=DL_DIR, py=DL_PY) if use_dl else run_cmd(args)
+        log.append(f"{'✅' if rc == 0 else '⚠️'} {name} —— {'成功' if rc == 0 else '失败'}")
+        if rc != 0:
+            log.append("   " + (out[-300:] or ""))
+    log.append("\n全部完成。可在「查看报告」看结果。")
+    JOBS["all"] = {"status": "done", "output": "\n".join(log)}
+
+
+@app.route("/runasync/<aid>", methods=["POST"])
+def runasync(aid):
+    if aid != "all" and aid not in ACTIONS:
+        return jsonify(ok=False, err="未知操作")
+    if (JOBS.get(aid) or {}).get("status") == "running":
+        return jsonify(ok=True, running=True)
+    JOBS[aid] = {"status": "running", "output": ""}
+    target = _job_all if aid == "all" else (lambda: _job_one(aid))
+    threading.Thread(target=target, daemon=True).start()
+    return jsonify(ok=True, started=True)
+
+
+@app.route("/job/<aid>")
+def job(aid):
+    j = JOBS.get(aid) or {"status": "idle", "output": ""}
+    return jsonify(status=j.get("status", "idle"), output=(j.get("output") or "")[-4000:])
+
+
 @app.route("/runall", methods=["POST"])
 def runall():
     log = []
     for name, args, use_dl in PIPELINE:
-        if use_dl:
-            rc, out = run_cmd(args, cwd=DL_DIR, py=DL_PY)
-        else:
-            rc, out = run_cmd(args)
+        rc, out = run_cmd(args, cwd=DL_DIR, py=DL_PY) if use_dl else run_cmd(args)
         log.append(f"{'✅' if rc == 0 else '⚠️'} {name} —— {'成功' if rc == 0 else '失败'}")
         if rc != 0:
             log.append("   " + (out[-400:] or ""))
-    log.append("\n全部完成。可在右侧「查看报告」看结果。")
+    log.append("\n全部完成。")
     return jsonify(ok=True, output="\n".join(log))
 
 
