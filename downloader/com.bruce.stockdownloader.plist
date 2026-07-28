@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bruce.stockdownloader</string>
+
+    <!-- 每天运行的命令 -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/bruce/stock_downloader/run.sh</string>
+    </array>
+
+    <!-- 每天 07:00 (新加坡时间) 触发 -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- 如果到点时电脑在睡眠/关机，开机后会尽快补跑一次 -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/bruce/stock_downloader</string>
+
+    <!-- launchd 自己的标准输出/错误（程序内部另有 logs/ 目录的日志） -->
+    <key>StandardOutPath</key>
+    <string>/Users/bruce/stock_downloader/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/bruce/stock_downloader/logs/launchd.err.log</string>
+</dict>
+</plist>

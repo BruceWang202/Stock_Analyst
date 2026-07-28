@@ -1,0 +1,10 @@
+.venv/
+downloader/.venv/
+__pycache__/
+*.pyc
+logs/
+*.log
+portfolio.json
+params_override.json
+.DS_Store
+/config.yaml
