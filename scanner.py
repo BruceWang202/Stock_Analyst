@@ -102,7 +102,8 @@ PARAMS = {
     "s5_tol": 0.02,          # 前高线容差(±2%)
     # ⑥ 缩量(地量) + 十日线向上(买) / 近最大量(卖)
     "s6_low_win": 120,       # 缩量参考的"最低量"回看窗口
-    "s6_near_low": 1.15,     # 地量阈值：当日量 ≤ 近low_win日最低量 × 此值(接近地量)
+    "s6_near_low": 1.08,     # 地量阈值：当日量 ≤ 近low_win日最低量 × 此值(越小越严, 越接近真地量)
+    "s6_cooldown": 10,       # 冷却：两次买入信号至少间隔的交易日数(避免密集重复)
     "s6_ma": 10,             # 均线周期(十日线)
     "s6_maxwin": 120,        # 卖出参考的"最大量"回看窗口
     "s6_sell_max_frac": 0.9, # 当日量 ≥ 窗口最大量 × 此值 → 卖出(近最大量)
@@ -331,14 +332,15 @@ def scan_s5(df):
 def scan_s6(df):
     p = PARAMS
     low_win = p.get("s6_low_win", 120)
-    near = p.get("s6_near_low", 1.15)
+    near = p.get("s6_near_low", 1.08)
+    cooldown = p.get("s6_cooldown", 10)
     maw = p.get("s6_ma", 10)
     vol = df["Volume"]
     ma = df["Close"].rolling(maw).mean()
     vmin = vol.rolling(low_win).min()       # 近 low_win 日最低量(地量参照)
     avg30 = vol.rolling(30).mean()
     hits, n = [], len(df)
-    prev_sig = False
+    prev_sig, last_i = False, -10 ** 9
     for i in range(low_win, n):
         v, lo = vol.iloc[i], vmin.iloc[i]
         if pd.isna(lo) or lo <= 0 or pd.isna(ma.iloc[i]) or pd.isna(ma.iloc[i - 1]):
@@ -347,7 +349,8 @@ def scan_s6(df):
         shrunk = v <= lo * near                        # 接近地量(近low_win日最低)
         ma_up = ma.iloc[i] > ma.iloc[i - 1]            # 十日线向上
         sig = shrunk and ma_up
-        if sig and not prev_sig:                        # 只在信号"新出现"时记
+        if sig and not prev_sig and (i - last_i) >= cooldown:   # 新信号 + 冷却期外
+            last_i = i
             a = avg30.iloc[i]
             hits.append({
                 "SignalDate": df["Date"].iloc[i],
