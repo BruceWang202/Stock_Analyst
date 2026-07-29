@@ -283,35 +283,85 @@ SCAN_STRATS = [
 ]
 
 
-def _sig_outcome(g, sig_date, target=0.15, window=30, stop=0.08):
-    """单条信号的目标单回测结果：次日开盘建仓→目标止盈/止损/到期。返回(结果, 收益%)。"""
+RUN_UP_DAYS = 3      # 建仓后须连涨的交易日数
+WIN_TARGET = 0.15    # 窗口内收盘价较建仓价的达标涨幅
+WIN_WINDOW = 30      # 达标观察窗口(交易日)
+DAY_STOP = 0.03      # 单日收盘跌幅超过此值即止损离场
+
+
+def _sig_outcome(g, sig_date, target=WIN_TARGET, window=WIN_WINDOW,
+                 run_up=RUN_UP_DAYS, day_stop=DAY_STOP):
+    """单条信号的预测判定与实际幅度。返回 (结果, 收益%, 离场)。
+
+    建仓：信号次日开盘价。
+    两个预测条件（与卖出无关，看满整个窗口）：
+      1) 建仓后头 run_up 个交易日连续收阳（每日收盘 > 前一日收盘）
+      2) window 个交易日内至少有一天收盘价较建仓价涨幅 > target
+    判定：两条都中=大胜🏆；中其一=胜利✅；都不中=失败❌。
+         带 * 表示窗口未走完、后续仍可能升级为大胜。
+    实际幅度：不设到期、不设止盈，唯一卖出点是「单日收盘跌幅 > day_stop」，
+             以触发当日收盘价卖出；未触发则一直持有到数据末（记为持有中）。"""
     import pandas as pd
     if g is None:
-        return ("无数据", None)
+        return ("无数据", None, "-")
     idx = g.index[g["Date"] == sig_date]
     if len(idx) == 0:
-        return ("无数据", None)
+        return ("无数据", None, "-")
     i = int(idx[0])
-    if i + 1 >= len(g):
-        return ("待开盘", None)
+    last = len(g) - 1
+    if i + 1 > last:
+        return ("待开盘", None, "-")
     entry = g["Open"].iloc[i + 1]
     if pd.isna(entry) or entry <= 0:
-        return ("无数据", None)
-    tp = entry * (1 + target)
-    sl = entry * (1 - stop) if stop else None
-    last = len(g) - 1
-    end = i + window
-    for j in range(i + 1, min(end, last) + 1):
-        cl = g["Close"].iloc[j]
-        if cl >= tp:
-            return ("止盈✅", round((cl / entry - 1) * 100, 1))
-        if sl is not None and cl <= sl:
-            return ("止损❌", round((cl / entry - 1) * 100, 1))
-    if end <= last:                                  # 窗口已走完，未触及目标/止损
-        r = (g["Close"].iloc[end] / entry - 1) * 100
-        return ("到期" + ("✅" if r > 0 else "❌"), round(r, 1))
-    r = (g["Close"].iloc[last] / entry - 1) * 100    # 数据还没满窗口
-    return ("持有中", round(r, 1))
+        return ("无数据", None, "-")
+    close = g["Close"]
+
+    # ── 实际幅度：持有到首个单日跌幅 > day_stop 的收盘 ──
+    exit_i, why = None, "持有中"
+    for j in range(i + 1, last + 1):
+        if close.iloc[j] / close.iloc[j - 1] - 1 < -day_stop:
+            exit_i, why = j, f"止损(第{j - i}日)"
+            break
+    if exit_i is None:
+        exit_i = last
+    ret = round((close.iloc[exit_i] / entry - 1) * 100, 1)
+
+    # ── 胜负预测：条件①连涨 run_up 日 ──
+    if i + run_up > last:
+        return ("观察中", ret, why)                       # 头几日还没走完
+    run_ok = all(close.iloc[j] > close.iloc[j - 1] for j in range(i + 1, i + run_up + 1))
+
+    # ── 条件②窗口内出现 > target 的收盘涨幅 ──
+    end = min(i + window, last)
+    hit = bool((close.iloc[i + 1:end + 1] / entry - 1 > target).any())
+
+    full = i + window <= last                             # 窗口是否已走完
+    if run_ok and hit:
+        return ("大胜🏆", ret, why)
+    if run_ok or hit:                                     # 中其一即已胜；窗口未满则仍可能升级
+        return ("胜利✅" if full else "胜利✅*", ret, why)
+    if not full:
+        return ("观察中", ret, why)                       # 两条都未中，但②还有机会
+    return ("失败❌", ret, why)
+
+
+def _win_line(done):
+    """已判定信号的胜负小结：大胜/胜利/失败各自笔数与平均实际幅度。"""
+    n = len(done)
+    if not n:
+        return ""
+    def blk(name, mask):
+        k = int(mask.sum())
+        if not k:
+            return f"{name} 0"
+        a = done.loc[mask, "收益%"].dropna().mean()
+        amp = f"，均幅 {a:+.1f}%" if a == a else ""
+        return f"{name} {k}（{k/n*100:.0f}%{amp}）"
+    res = done["结果"]
+    big, small, bad = res.str.startswith("大胜"), res.str.startswith("胜利"), res.str.startswith("失败")
+    win = int((big | small).sum())
+    return (f"　已判定 {n} · 胜率 {win/n*100:.0f}%　|　"
+            + " · ".join([blk("大胜", big), blk("胜利", small), blk("失败", bad)]))
 
 
 def build_scan_html():
@@ -350,7 +400,10 @@ def build_scan_html():
         parts.append(pd.DataFrame(ov).to_html(index=False, border=0))
     # ── 二、按策略(④⑥⑤①·胜率序)：昨日信号 + 近90天(带回测胜败) ──
     parts.append("<h2>二、分策略信号（④⑥⑤① · 按胜率排序）</h2>")
-    parts.append("<p class=note>近90天信号「结果」列为目标单回测：次日开盘建仓 → 30日内 +15% 止盈 / -8% 止损 / 到期离场。</p>")
+    parts.append("<p class=note>近90天信号：次日开盘建仓。两个预测条件——"
+                 "①建仓后连涨3日　②30日内有一天收盘较建仓价涨超15%。"
+                 "两条都中＝<b>大胜🏆</b>，中其一＝<b>胜利✅</b>（带 * 为窗口未满、仍可能升级），都不中＝<b>失败❌</b>。"
+                 "「收益%」＝实际幅度：不设到期与止盈，唯一卖出点为单日收盘跌幅超3%，未触发则持有至今。</p>")
     series = _s6_series() if frames else {}
     cut = (gmax - pd.Timedelta(days=90)) if gmax is not None else None
     for label, fn in SCAN_STRATS:
@@ -371,15 +424,30 @@ def build_scan_html():
         recent = d[d["SignalDate"] >= cut].sort_values("SignalDate", ascending=False)
         rows = []
         for _, r in recent.iterrows():
-            res, ret = _sig_outcome(series.get(r["Ticker"]), r["SignalDate"])
+            res, ret, why = _sig_outcome(series.get(r["Ticker"]), r["SignalDate"])
             rows.append({"信号日": r["SignalDate"].date(), "代码": r["Ticker"], "名称": r.get("名称", ""),
-                         "行业": r.get("行业", ""), "结果": res, "收益%": ret})
+                         "行业": r.get("行业", ""), "结果": res, "收益%": ret, "离场": why})
         rr = pd.DataFrame(rows)
-        done = rr[~rr["结果"].isin(["持有中", "无数据", "待开盘"])] if not rr.empty else rr
-        win = int(done["结果"].str.contains("✅").sum()) if not done.empty else 0
-        wr = f"　已结 {len(done)} · 胜 {win}（{win/len(done)*100:.0f}%）" if len(done) else ""
-        parts.append(f"<h4>近90天信号（{len(recent)} 个）{wr}</h4>")
-        parts.append(rr.to_html(index=False, border=0) if not rr.empty else "<p>无</p>")
+        done = rr[~rr["结果"].isin(["观察中", "无数据", "待开盘"])] if not rr.empty else rr
+        parts.append(f"<h4>近90天信号（{len(recent)} 个）{_win_line(done)}</h4>")
+        if not rows:
+            parts.append("<p>无</p>")
+            continue
+        h = ["<table><thead><tr><th>信号日</th><th>代码</th><th>名称</th><th>行业</th>"
+             "<th>结果</th><th>收益%</th><th>离场</th></tr></thead><tbody>"]
+        for row in rows:
+            res, ret = row["结果"], row["收益%"]
+            rc = ("var(--ok);font-weight:600" if "🏆" in res else
+                  "var(--ok)" if "✅" in res else
+                  "#e5484d" if "❌" in res else "var(--warn)")
+            retc = "var(--ok)" if (ret is not None and ret > 0) else ("#e5484d" if (ret is not None and ret < 0) else "var(--mut)")
+            rets = f"{ret:+.1f}%" if ret is not None else "-"
+            h.append(f"<tr><td>{row['信号日']}</td><td>{row['代码']}</td><td>{row['名称']}</td>"
+                     f"<td>{row['行业']}</td><td style='color:{rc}'>{res}</td>"
+                     f"<td style='color:{retc}'>{rets}</td>"
+                     f"<td style='color:var(--mut)'>{row['离场']}</td></tr>")
+        h.append("</tbody></table>")
+        parts.append("".join(h))
     return "".join(parts)
 
 
