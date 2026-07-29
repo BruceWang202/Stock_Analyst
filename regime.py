@@ -107,6 +107,33 @@ def recent_table(g, n=7):
     return out.tail(n).iloc[::-1].reset_index(drop=True)   # 从新到旧
 
 
+def breadth_overlay():
+    """
+    读 breadth.py 产出的 breadth.csv，把宽度预警贴到市场状态报告里。
+
+    指数是权重股加权的，可以在多数个股已经转弱时继续新高；宽度数的是家数，
+    所以两者背离时应以宽度为警。breadth.csv 不存在就提示先跑 breadth.py。
+    """
+    path = os.path.join(OUT, "breadth.csv")
+    if not os.path.exists(path):
+        return ["（未找到 breadth.csv —— 先运行 `python breadth.py` 生成宽度数据）"]
+    try:
+        from breadth import MKT_NAME, warnings_of
+        b = pd.read_csv(path)
+        b["Date"] = pd.to_datetime(b["Date"])
+        lines = []
+        for mkt, g in b.groupby("市场"):
+            last = g.sort_values("Date").iloc[-1]
+            lines.append(f"**{MKT_NAME.get(mkt, mkt)}**（{last['Date'].date()}，"
+                         f"池内 {int(last['家数'])} 只）")
+            for w in warnings_of(last):
+                lines.append(f"- {w}")
+            lines.append("")
+        return lines or ["（无宽度数据）"]
+    except Exception as e:
+        return [f"（宽度数据读取失败：{e}）"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="/Users/bruce/Documents/Stock")
@@ -130,6 +157,8 @@ def main():
             "- 标准: 牛=价在年线上+年线升+近高点；熊=回撤≥20%或价在年线下且年线降；余为震荡",
             "- ⚠️ 仅技术状态标注，不构成投资建议\n",
             "## 当前状态一览\n", cdf.to_markdown(index=False)]
+
+    text += ["\n## 宽度叠加（指数之外，看涨得普不普遍）\n"] + breadth_overlay()
 
     for sym in INDEX_SYMS:
         g = s.get(sym)

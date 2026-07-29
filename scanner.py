@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-形态扫描器 —— 在已下载的日线数据上跑 3 个策略，输出命中列表。
+形态扫描器 —— 在已下载的日线数据上跑各策略，输出命中列表。
 
-策略（详见 /Users/bruce/Documents/AICode/Stock/策略.md）：
+策略 ①③④⑤⑥ 详见 /Users/bruce/Documents/AICode/Stock/策略.md：
   ① 成都  平台突破后的缩量回踩
+  ③ 广州  年线附近放量突破
   ④ 郑州  下跌趋势末期的日线 MACD 底背离
   ⑤ 杭州  放量突破前高后回踩前高不破
+  ⑥       缩量(地量) + 十日线向上
+公开形态（非上文来源）：
+  ⑦ VCP 波动收缩（Minervini）：回调逐级收窄 + 量能递减 + 放量破 pivot
+  ⑧ 52周新高动量（达韦斯箱体）：窄箱体整理后放量创 52 周新高
+  ⑨ 一阳穿三线：低位三线粘合，放量阳线实体同时穿越 MA5/10/30
 
 ⚠️ 这些是把文字形态**简化后的量化规则**，参数在下方 PARAMS 里可调。
    结果仅为形态的技术识别，**不构成任何投资建议**。
@@ -44,6 +50,9 @@ STRATEGY_KINDS = {
     "s4": {"stock", "etf"},
     "s5": {"stock", "etf"},
     "s6": {"stock", "etf"},
+    "s7": {"stock"},          # VCP 是成长股形态，ETF 极少走出逐级收缩
+    "s8": {"stock", "etf"},
+    "s9": {"stock", "etf"},
 }
 
 
@@ -111,6 +120,30 @@ PARAMS = {
     "s6_sky_win": 250,       # 天量分位数的回看窗口(该股自身历史)
     "s6_sky_pct": 0.99,      # 天量分位阈值(0.99=进入该股最高1%的量=真天量)；调低更早卖
     "s6_stop": 0.08,         # 保护性止损：跌破买入价此比例
+    # ⑦ VCP 波动收缩(Minervini)
+    "s7_base_win": 120,      # 基底回看窗口(交易日)，收缩序列在此窗口内识别
+    "s7_swing_w": 5,         # 摆动高/低点识别半窗(太小会把日常噪音当成收缩)
+    "s7_min_depth": 0.03,    # 回调深度小于此值视为噪音，不计入收缩序列
+    "s7_min_contractions": 2,  # 末段逐级收窄的最少段数
+    "s7_max_contractions": 4,  # 末段逐级收窄的最多段数(超过说明是长期阴跌，不是收缩)
+    "s7_shrink": 0.8,        # 每次回调深度须 ≤ 上一次 × 此值(逐级收窄)
+    "s7_last_max": 0.10,     # 最后一次回调深度上限(收得够紧才算 VCP)
+    "s7_vol_mult": 1.5,      # 突破日放量倍数
+    "s7_near_high": 0.75,    # 突破日收盘须 ≥ 近250日最高 × 此值(不在深坑里)
+    "s7_cooldown": 20,       # 同股两次信号最小间隔
+    # ⑧ 52周新高动量(达韦斯箱体)
+    "s8_hi_win": 250,        # "52周高点"回看窗口
+    "s8_box_win": 20,        # 突破前的箱体整理窗口
+    "s8_box_max_range": 0.20,  # 箱体(高-低)/低 上限，越小越"紧"
+    "s8_vol_mult": 1.5,      # 突破日放量倍数
+    "s8_cooldown": 20,       # 同股两次信号最小间隔(创新高常连续出现)
+    # ⑨ 一阳穿三线
+    "s9_ma": (5, 10, 30),    # 被穿越的三条均线
+    "s9_cohesion": 0.03,     # 三线粘合度：(最高线-最低线)/最低线 上限
+    "s9_vol_mult": 2.0,      # 当日放量倍数(资料普遍要求 2 倍以上)
+    "s9_hi_win": 250,        # 判断"低位"的高点回看窗口
+    "s9_from_high": 0.15,    # 收盘须 ≤ 窗口最高 × (1-此值)，即距高点至少回落这么多
+    "s9_cooldown": 10,       # 同股两次信号最小间隔
 }
 
 # 参数覆盖：仪表盘滑块保存的值(如天量分位)会写到此文件，导入时合并进 PARAMS
@@ -364,6 +397,187 @@ def scan_s6(df):
 
 
 # ----------------------------------------------------------------------
+# ⑦ VCP 波动收缩（Minervini）
+#    上升趋势中，回调一次比一次浅、量一次比一次小，最后放量突破最后一个高点。
+# ----------------------------------------------------------------------
+def _swing_highs(df, w):
+    highs, high = [], df["High"].values
+    for i in range(w, len(df) - w):
+        if high[i] == high[i - w:i + w + 1].max():
+            highs.append(i)
+    return highs
+
+
+def _contractions(df, sh, sl, lo_b, hi_b):
+    """在 [lo_b, hi_b] 区间内按「高点→其后第一个低点」配对，返回(回调深度序列, 对应高点价序列)。"""
+    pts = sorted([(j, "H") for j in sh if lo_b <= j <= hi_b]
+                 + [(j, "L") for j in sl if lo_b <= j <= hi_b])
+    depths, peaks = [], []
+    k = 0
+    while k < len(pts):
+        if pts[k][1] != "H":
+            k += 1
+            continue
+        m = k + 1
+        while m < len(pts) and pts[m][1] != "L":
+            m += 1
+        if m >= len(pts):
+            break
+        hv = df["High"].iloc[pts[k][0]]
+        lv = df["Low"].iloc[pts[m][0]]
+        if hv > 0:
+            depths.append((hv - lv) / hv)
+            peaks.append(hv)
+        k = m + 1
+    return depths, peaks
+
+
+def scan_s7(df):
+    p = PARAMS
+    win, w, vmult = p["s7_base_win"], p["s7_swing_w"], p["s7_vol_mult"]
+    shrink, last_max, min_depth = p["s7_shrink"], p["s7_last_max"], p["s7_min_depth"]
+    min_c, max_c = p["s7_min_contractions"], p["s7_max_contractions"]
+    near_hi, cooldown = p["s7_near_high"], p["s7_cooldown"]
+    n = len(df)
+    ma50 = df["Close"].rolling(50).mean()
+    ma150 = df["Close"].rolling(150).mean()
+    ma200 = df["Close"].rolling(200).mean()
+    hi250 = df["High"].rolling(250, min_periods=60).max()
+    # 摆动点用 ±w 窗口识别，故第 j 根要到 j+w 才能确认；下面只取 j ≤ i-1-w 的点，避免用到未来数据
+    sh, sl = _swing_highs(df, w), _swing_lows(df, w)
+    hits, last_i = [], -10 ** 9
+    for i in range(win, n):
+        r = df.iloc[i]
+        vma = r["VolMA20"]
+        if pd.isna(vma) or vma <= 0 or pd.isna(ma200.iloc[i]):
+            continue
+        # 趋势过滤：价在 MA50 上，且 MA50 > MA150 > MA200（多头排列）
+        if not (r["Close"] > ma50.iloc[i] > ma150.iloc[i] > ma200.iloc[i]):
+            continue
+        h250 = hi250.iloc[i]
+        if pd.isna(h250) or r["Close"] < h250 * near_hi:
+            continue
+        depths, peaks = _contractions(df, sh, sl, i - win, i - 1 - w)
+        # 滤掉噪音级别的浅回调，再从末尾往前数「一段比一段浅」的连续长度
+        seq = [(d, pk) for d, pk in zip(depths, peaks) if d >= min_depth]
+        if len(seq) < min_c:
+            continue
+        t, run = len(seq) - 1, 1
+        while t > 0 and seq[t][0] <= seq[t - 1][0] * shrink:
+            run += 1
+            t -= 1
+        if not (min_c <= run <= max_c):
+            continue                                    # 末段没有逐级收窄
+        if seq[-1][0] > last_max:
+            continue                                    # 最后一段收得不够紧
+        depths, pivot = [d for d, _ in seq[-run:]], seq[-1][1]
+        # 放量阳线突破最后一个收缩高点(pivot)
+        if not (r["Close"] > pivot and r["Close"] > r["Open"] and r["Volume"] >= vmult * vma):
+            continue
+        # 基底期量能递减：后 1/3 均量 < 前 1/3 均量
+        base = df["Volume"].iloc[i - win:i]
+        third = max(1, len(base) // 3)
+        if not (base.iloc[-third:].mean() < base.iloc[:third].mean()):
+            continue
+        if i - last_i < cooldown:
+            continue
+        last_i = i
+        hits.append({
+            "SignalDate": r["Date"], "Pivot": round(pivot, 4),
+            "收缩次数": len(depths),
+            "收缩序列%": "→".join(f"{d*100:.0f}" for d in depths),
+            "量比": round(r["Volume"] / vma, 2),
+            "距52周高%": round((r["Close"] / h250 - 1) * 100, 1),
+            "BuyClose": round(r["Close"], 4),
+        })
+    return hits
+
+
+# ----------------------------------------------------------------------
+# ⑧ 52 周新高动量（达韦斯箱体）
+#    窄箱体整理后放量创 52 周新高 —— 动量效应是少数被反复验证的异象。
+# ----------------------------------------------------------------------
+def scan_s8(df):
+    p = PARAMS
+    hi_win, box_win = p["s8_hi_win"], p["s8_box_win"]
+    box_max, vmult, cooldown = p["s8_box_max_range"], p["s8_vol_mult"], p["s8_cooldown"]
+    n = len(df)
+    prior_hi = df["High"].rolling(hi_win).max().shift(1)   # 不含当日，避免自比
+    hits, last_i = [], -10 ** 9
+    for i in range(hi_win + box_win, n):
+        r = df.iloc[i]
+        vma, ph = r["VolMA20"], prior_hi.iloc[i]
+        if pd.isna(vma) or vma <= 0 or pd.isna(ph) or ph <= 0:
+            continue
+        # 放量阳线创 52 周新高
+        if not (r["Close"] > ph and r["Close"] > r["Open"] and r["Volume"] >= vmult * vma):
+            continue
+        box = df.iloc[i - box_win:i]
+        bh, bl = box["High"].max(), box["Low"].min()
+        if bl <= 0 or (bh - bl) / bl > box_max:
+            continue                                    # 突破前箱体不够紧
+        if i - last_i < cooldown:
+            continue
+        last_i = i
+        hits.append({
+            "SignalDate": r["Date"], "PrevHigh52w": round(ph, 4),
+            "BoxHigh": round(bh, 4), "BoxLow": round(bl, 4),
+            "箱体幅%": round((bh / bl - 1) * 100, 1),
+            "量比": round(r["Volume"] / vma, 2),
+            "BuyClose": round(r["Close"], 4),
+        })
+    return hits
+
+
+# ----------------------------------------------------------------------
+# ⑨ 一阳穿三线
+#    低位三线粘合，一根放量阳线的实体同时穿越 MA5/MA10/MA30。
+# ----------------------------------------------------------------------
+def scan_s9(df):
+    p = PARAMS
+    f, m, s = p["s9_ma"]
+    coh, vmult = p["s9_cohesion"], p["s9_vol_mult"]
+    hi_win, from_hi, cooldown = p["s9_hi_win"], p["s9_from_high"], p["s9_cooldown"]
+    n = len(df)
+    m1 = df["Close"].rolling(f).mean()
+    m2 = df["Close"].rolling(m).mean()
+    m3 = df["Close"].rolling(s).mean()
+    hi = df["High"].rolling(hi_win, min_periods=60).max()
+    hits, last_i = [], -10 ** 9
+    for i in range(s + 1, n):
+        a, b, c = m1.iloc[i], m2.iloc[i], m3.iloc[i]
+        if pd.isna(a) or pd.isna(b) or pd.isna(c):
+            continue
+        lo3, hi3 = min(a, b, c), max(a, b, c)
+        if lo3 <= 0 or (hi3 - lo3) / lo3 > coh:
+            continue                                    # 三线不够粘合
+        r = df.iloc[i]
+        vma = r["VolMA20"]
+        if pd.isna(vma) or vma <= 0:
+            continue
+        # 阳线实体自三线下方穿到三线上方
+        if not (r["Open"] < lo3 and r["Close"] > hi3):
+            continue
+        if r["Volume"] < vmult * vma:
+            continue
+        h = hi.iloc[i]
+        if pd.isna(h) or r["Close"] > h * (1 - from_hi):
+            continue                                    # 不在低位，是追高
+        if i - last_i < cooldown:
+            continue
+        last_i = i
+        hits.append({
+            "SignalDate": r["Date"],
+            "MA5": round(a, 4), "MA10": round(b, 4), "MA30": round(c, 4),
+            "粘合度%": round((hi3 / lo3 - 1) * 100, 2),
+            "量比": round(r["Volume"] / vma, 2),
+            "距高点%": round((r["Close"] / h - 1) * 100, 1),
+            "BuyClose": round(r["Close"], 4),
+        })
+    return hits
+
+
+# ----------------------------------------------------------------------
 # 主流程
 # ----------------------------------------------------------------------
 SCANS = [
@@ -372,6 +586,9 @@ SCANS = [
     ("s4", "strategy4_macd_divergence",   "④ MACD 底背离",      scan_s4),
     ("s5", "strategy5_prevhigh_retest",   "⑤ 放量突破前高回踩",  scan_s5),
     ("s6", "strategy6_vol_shrink_ma10",   "⑥ 缩量+十日线向上",    scan_s6),
+    ("s7", "strategy7_vcp",               "⑦ VCP 波动收缩",      scan_s7),
+    ("s8", "strategy8_52w_high",          "⑧ 52周新高动量",      scan_s8),
+    ("s9", "strategy9_ma_pierce",         "⑨ 一阳穿三线",        scan_s9),
 ]
 
 
@@ -405,7 +622,7 @@ def main():
         "",
         f"- 生成时间(数据最新日): {data_max.date()}",
         f"- 股票池: {len(series)} 只 ({', '.join(series.keys())})",
-        "- 策略: ① 平台突破缩量回踩 / ④ MACD 底背离 / ⑤ 放量突破前高回踩",
+        "- 策略: " + " / ".join(label for _, _, label, _ in SCANS),
         "- ⚠️ 简化量化规则，仅形态技术识别，**不构成投资建议**。",
         "",
     ]

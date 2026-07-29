@@ -193,6 +193,10 @@ async function refreshState(){const r=await fetch('/state');const j=await r.json
  $('#state').innerHTML=wk+j.chips.map(c=>'<span class=chip>'+esc(c)+'</span>').join('');
  const sel=$('#csv');sel.innerHTML='<option value="">选择…</option>'+j.csvs.map(c=>'<option>'+c+'</option>').join('')}
 function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function filterSigs(t){document.querySelectorAll('tr.sig90').forEach(tr=>{tr.style.display=(t==='all'||tr.dataset.r===t)?'':'none'})}
+function sortSig(th){const tb=th.closest('table');const asc=tb.dataset.asc!=='1';tb.dataset.asc=asc?'1':'0';
+ const body=tb.querySelector('tbody');const rows=[...body.querySelectorAll('tr')];
+ rows.sort((a,b)=>(parseFloat(a.dataset.ret||0)-parseFloat(b.dataset.ret||0))*(asc?1:-1));rows.forEach(r=>body.append(r))}
 refreshState();
 </script></body></html>"""
 
@@ -274,12 +278,16 @@ def runall():
     return jsonify(ok=True, output="\n".join(log))
 
 
-# 扫描页展示的策略与顺序(按胜率高→低)：④ ⑥ ⑤ ①（其余不展示）
+# 扫描页展示的全部策略，按全历史胜率高→低排序（数据变了记得重排）
 SCAN_STRATS = [
     ("④ MACD 底背离", "strategy4_macd_divergence.csv"),
-    ("⑥ 缩量+十日线向上", "strategy6_vol_shrink_ma10.csv"),
-    ("⑤ 放量突破前高回踩", "strategy5_prevhigh_retest.csv"),
+    ("③ 年线放量突破", "strategy3_annual_line.csv"),
+    ("⑦ VCP 波动收缩", "strategy7_vcp.csv"),
     ("① 平台突破缩量回踩", "strategy1_platform_pullback.csv"),
+    ("⑤ 放量突破前高回踩", "strategy5_prevhigh_retest.csv"),
+    ("⑧ 52周新高动量", "strategy8_52w_high.csv"),
+    ("⑥ 缩量+十日线向上", "strategy6_vol_shrink_ma10.csv"),
+    ("⑨ 一阳穿三线", "strategy9_ma_pierce.csv"),
 ]
 
 
@@ -364,6 +372,19 @@ def _win_line(done):
             + " · ".join([blk("大胜", big), blk("胜利", small), blk("失败", bad)]))
 
 
+def _hist_winrate(series, d, ticker):
+    """该 ticker 在此策略全部历史信号的历史胜率(已判定中 大胜/胜利 的占比)。"""
+    g = series.get(ticker)
+    if g is None:
+        return "-"
+    res = [_sig_outcome(g, sd)[0] for sd in d[d["Ticker"] == ticker]["SignalDate"]]
+    done = [r for r in res if r not in ("观察中", "无数据", "待开盘")]
+    if not done:
+        return "-"
+    win = sum(1 for r in done if r.startswith("大胜") or r.startswith("胜利"))
+    return f"{win}/{len(done)} ({win/len(done)*100:.0f}%)"
+
+
 def build_scan_html():
     """从现有扫描结果文件构建结构化视图(不重新扫描)。"""
     import pandas as pd
@@ -381,7 +402,7 @@ def build_scan_html():
         frames[label] = d
         m = d["SignalDate"].max()
         gmax = m if gmax is None else max(gmax, m)
-    # ── 一、形态扫描结果(概览：仅 ④⑥⑤①) ──
+    # ── 一、形态扫描结果(全部策略概览) ──
     parts.append("<h2>一、形态扫描结果</h2>")
     if gmax is not None:
         c90 = gmax - pd.Timedelta(days=90)
@@ -398,12 +419,19 @@ def build_scan_html():
                        "昨日": int((d["SignalDate"] == gmax).sum())})
         parts.append(f"<p class=note>最新信号日 {gmax.date()}</p>")
         parts.append(pd.DataFrame(ov).to_html(index=False, border=0))
-    # ── 二、按策略(④⑥⑤①·胜率序)：昨日信号 + 近90天(带回测胜败) ──
-    parts.append("<h2>二、分策略信号（④⑥⑤① · 按胜率排序）</h2>")
+    # ── 二、按策略(胜率序)：昨日信号 + 近90天(带胜负判定) ──
+    parts.append("<h2>二、分策略信号（全部策略 · 按全历史胜率排序）</h2>")
     parts.append("<p class=note>近90天信号：次日开盘建仓。两个预测条件——"
                  "①建仓后连涨3日　②30日内有一天收盘较建仓价涨超15%。"
                  "两条都中＝<b>大胜🏆</b>，中其一＝<b>胜利✅</b>（带 * 为窗口未满、仍可能升级），都不中＝<b>失败❌</b>。"
                  "「收益%」＝实际幅度：不设到期与止盈，唯一卖出点为单日收盘跌幅超3%，未触发则持有至今。</p>")
+    parts.append('<div style="margin:8px 0;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+                 '<span class=note>90天信号筛选:</span>'
+                 '<button onclick="filterSigs(\'all\')" style="width:auto;padding:3px 10px;margin:0">全部</button>'
+                 '<button onclick="filterSigs(\'win\')" style="width:auto;padding:3px 10px;margin:0;color:var(--ok)">胜(大胜/胜利)</button>'
+                 '<button onclick="filterSigs(\'loss\')" style="width:auto;padding:3px 10px;margin:0;color:#e5484d">失败</button>'
+                 '<button onclick="filterSigs(\'hold\')" style="width:auto;padding:3px 10px;margin:0;color:var(--warn)">观察中</button>'
+                 '<span class=note>（点「收益%」列头排序）</span></div>')
     series = _s6_series() if frames else {}
     cut = (gmax - pd.Timedelta(days=90)) if gmax is not None else None
     for label, fn in SCAN_STRATS:
@@ -418,7 +446,8 @@ def build_scan_html():
         if y.empty:
             parts.append("<p>昨日无信号</p>")
         else:
-            yt = pd.DataFrame({"代码": y["Ticker"], "名称": y.get("名称", ""), "行业": y.get("行业", "")})
+            yt = pd.DataFrame({"代码": y["Ticker"], "名称": y.get("名称", ""), "行业": y.get("行业", ""),
+                               "历史胜率": [_hist_winrate(series, d, t) for t in y["Ticker"]]})
             parts.append(yt.to_html(index=False, border=0))
         # 近90天信号 + 回测胜败
         recent = d[d["SignalDate"] >= cut].sort_values("SignalDate", ascending=False)
@@ -434,7 +463,8 @@ def build_scan_html():
             parts.append("<p>无</p>")
             continue
         h = ["<table><thead><tr><th>信号日</th><th>代码</th><th>名称</th><th>行业</th>"
-             "<th>结果</th><th>收益%</th><th>离场</th></tr></thead><tbody>"]
+             "<th>结果</th><th onclick=\"sortSig(this)\" style=\"cursor:pointer\">收益%↕</th>"
+             "<th>离场</th></tr></thead><tbody>"]
         for row in rows:
             res, ret = row["结果"], row["收益%"]
             rc = ("var(--ok);font-weight:600" if "🏆" in res else
@@ -442,7 +472,9 @@ def build_scan_html():
                   "#e5484d" if "❌" in res else "var(--warn)")
             retc = "var(--ok)" if (ret is not None and ret > 0) else ("#e5484d" if (ret is not None and ret < 0) else "var(--mut)")
             rets = f"{ret:+.1f}%" if ret is not None else "-"
-            h.append(f"<tr><td>{row['信号日']}</td><td>{row['代码']}</td><td>{row['名称']}</td>"
+            cat = "win" if (res.startswith("大胜") or res.startswith("胜利")) else ("loss" if res.startswith("失败") else "hold")
+            h.append(f"<tr class=sig90 data-r={cat} data-ret={ret if ret is not None else 0}>"
+                     f"<td>{row['信号日']}</td><td>{row['代码']}</td><td>{row['名称']}</td>"
                      f"<td>{row['行业']}</td><td style='color:{rc}'>{res}</td>"
                      f"<td style='color:{retc}'>{rets}</td>"
                      f"<td style='color:var(--mut)'>{row['离场']}</td></tr>")
@@ -457,6 +489,19 @@ VIEW_REPORT = {
     "synth": "策略优选.md", "backtest": "backtest.md", "sector": "行业胜率.md",
     "vol": "成交量参考.md",
 }
+
+
+def colorize(html):
+    """给报告表格的数值上色：负数→红，带+的正数→绿。"""
+    def repl(m):
+        pre, inner = m.group(1), m.group(2)
+        s = inner.strip()
+        if re.fullmatch(r"-\d+(\.\d+)?%?", s):
+            return f'<td{pre} style="color:#e5484d">{inner}</td>'
+        if re.fullmatch(r"\+\d+(\.\d+)?%?", s):
+            return f'<td{pre} style="color:var(--ok)">{inner}</td>'
+        return m.group(0)
+    return re.sub(r"<td([^>]*)>([^<]*)</td>", repl, html)
 
 
 @app.route("/view/<aid>")
@@ -475,7 +520,7 @@ def view(aid):
         p = os.path.join(OUT, VIEW_REPORT[aid])
         if not os.path.exists(p):
             return jsonify(ok=True, html="<p class=note>尚无结果，请点『🔄 重新执行』生成。</p>")
-        return jsonify(ok=True, html=stamp(p) + md.markdown(open(p, encoding="utf-8").read(), extensions=["tables"]))
+        return jsonify(ok=True, html=stamp(p) + colorize(md.markdown(open(p, encoding="utf-8").read(), extensions=["tables"])))
     if aid == "meta":
         p = os.path.join(OUT, "metadata.csv")
         if not os.path.exists(p):
@@ -506,7 +551,7 @@ def report():
     path = os.path.join(OUT, fn) if fn else None
     if not path or not os.path.exists(path):
         return jsonify(ok=False, err=f"报告不存在：{fn}（先执行对应流程生成）")
-    html = md.markdown(open(path, encoding="utf-8").read(), extensions=["tables", "fenced_code"])
+    html = colorize(md.markdown(open(path, encoding="utf-8").read(), extensions=["tables", "fenced_code"]))
     return jsonify(ok=True, html=html)
 
 

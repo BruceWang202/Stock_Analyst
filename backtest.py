@@ -34,6 +34,8 @@ STRATS = [
     ("strategy4_macd_divergence.csv",   "④ MACD 底背离",      "s4", "跌破背离低点"),
     ("strategy5_prevhigh_retest.csv",   "⑤ 放量突破前高回踩",  "s5", "跌破前高线"),
     ("strategy6_vol_shrink_ma10.csv",   "⑥ 缩量+十日线向上",    "s6", "近最大量卖出/跌破成本8%"),
+    ("strategyP_patterns.csv",          "Ⓟ 图表形态(头肩底/双底/VCP/三角)", "sp", "跌破形态失效位"),
+    ("strategyT_trend_template.csv",    "Ⓣ Minervini趋势模板", "st", "跌破结构止损位"),
 ]
 
 
@@ -45,6 +47,11 @@ def make_stop(strat, hit):
         lvl = hit["NewLow"];   return lambda g, j: g["Close"].iloc[j] < lvl
     if strat == "s5":
         lvl = hit["PrevHigh"]; return lambda g, j: g["Close"].iloc[j] < lvl
+    if strat in ("sp", "st"):               # 两者的止损位都由扫描器算好写在 StopLevel 列
+        lvl = hit.get("StopLevel")
+        if lvl is None or lvl != lvl:          # 无失效位(理论上不该有) -> 不止损
+            return lambda g, j: False
+        return lambda g, j: g["Close"].iloc[j] < lvl
     if strat == "s3":
         return lambda g, j: g["Close"].iloc[j] < g["MA250"].iloc[j]
     if strat == "s6":
@@ -165,12 +172,27 @@ def main():
                 continue
             t = run_trade(g, h["SignalDate"], make_stop(strat, h), args.max_hold)
             if t:
-                rows.append({"Ticker": h["Ticker"], "SignalDate": h["SignalDate"].date(), **t})
+                extra = {"Pattern": h["Pattern"]} if "Pattern" in hits.columns else {}
+                rows.append({"Ticker": h["Ticker"], "SignalDate": h["SignalDate"].date(),
+                             **extra, **t})
         rr = pd.DataFrame(rows)
         if rr.empty:
             continue
         st = agg_stats(rr)
         summary_rows.append({"策略": label, "止损位": stopdesc, **st})
+
+        # 形态策略再按形态细分——合计好看不代表每种形态都好
+        if "Pattern" in rr.columns:
+            sub = []
+            for pat, grp in rr.groupby("Pattern"):
+                if len(grp) >= 3:      # 少于3笔无统计意义
+                    sub.append({"形态": pat, **agg_stats(grp)})
+            if sub:
+                detail_blocks.append(f"### {label} 按形态细分（全部历史，≥3笔）\n")
+                detail_blocks.append(pd.DataFrame(sub)
+                                     .sort_values("平均收益%", ascending=False)
+                                     .to_markdown(index=False))
+                detail_blocks.append("")
 
         # 最近N天明细
         rrd = rr[pd.to_datetime(rr["SignalDate"]) >= cut]
